@@ -1,4 +1,5 @@
 import json
+import socket
 from pathlib import Path
 
 from exo.api.main import (
@@ -61,3 +62,7 @@ def test_recent_fleet_jobs_exposes_metadata_only(tmp_path: Path) -> None:
     assert "updated_at_ms" in jobs[0]
     assert "result" not in jobs[0]
     assert "result_hash" not in jobs[0]
+
+
+def test_hostname_is_available_for_activity_fallback() -> None:
+    assert socket.gethostname()

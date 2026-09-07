@@ -72,6 +72,12 @@
     node_id: string;
     sampled_at: string;
     sample_interval_seconds: number;
+    host?: {
+      hostname?: string;
+      device_id?: string;
+      role?: string;
+      zerotier_ip?: string;
+    };
     cpu: {
       system_percent: number;
       per_core_percent: number[];
@@ -239,12 +245,17 @@
       const system = clusterState?.nodeSystem?.[nodeId];
       const disk = clusterState?.nodeDisk?.[nodeId];
       const activity = activities[nodeId] ?? null;
-      const activityIp = activity?.api_origin
+      const originIp = activity?.api_origin
         ? new URL(activity.api_origin).hostname
         : "";
+      const activityIp = activity?.host?.zerotier_ip ?? originIp;
       const ip = nodeIp(nodeId) || activityIp;
       const fleet =
-        fleetNodes().find((item) => item.zerotier_ip === ip) ?? null;
+        fleetNodes().find(
+          (item) =>
+            item.zerotier_ip === ip ||
+            item.device_id === activity?.host?.device_id,
+        ) ?? null;
       const memoryTotal =
         activity?.memory.total_bytes ?? memory?.ramTotal?.inBytes ?? 0;
       const memoryUsed =
@@ -257,8 +268,21 @@
 
       return {
         nodeId,
-        name: identity?.friendlyName ?? fleet?.role ?? nodeId.slice(0, 12),
-        model: identity?.modelId ?? identity?.chipId ?? "Unknown Mac",
+        name:
+          identity?.friendlyName ??
+          (fleet?.role === "pro"
+            ? "MacBook Pro"
+            : fleet?.role === "air"
+              ? "MacBook Air"
+              : activity?.host?.hostname ?? nodeId.slice(0, 12)),
+        model:
+          identity?.modelId ??
+          identity?.chipId ??
+          (fleet?.role === "pro"
+            ? "Apple M4 Max"
+            : fleet?.role === "air"
+              ? "Apple M5"
+              : "Unknown Mac"),
         ip,
         activity,
         fleet,

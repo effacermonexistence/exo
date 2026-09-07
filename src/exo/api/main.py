@@ -4,6 +4,7 @@ import hashlib
 import json
 import random
 import shutil
+import socket
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
@@ -549,6 +550,22 @@ class API:
 
             await self._refresh_fleet_snapshot(now)
             fleet_results = Path.home() / ".os1" / "fleet" / "results"
+            local_addresses = {
+                address.address
+                for addresses in psutil.net_if_addrs().values()
+                for address in addresses
+            }
+            local_fleet_node = next(
+                (
+                    node
+                    for node in cast(
+                        list[dict[str, object]],
+                        self._activity_fleet_cache.get("nodes", []),
+                    )
+                    if node.get("zerotier_ip") in local_addresses
+                ),
+                {},
+            )
 
             disk_payload: dict[str, object] = {
                 "read_bytes_per_second": 0.0,
@@ -595,6 +612,12 @@ class API:
                 "node_id": str(self.node_id),
                 "sampled_at": datetime.now(timezone.utc).isoformat(),
                 "sample_interval_seconds": elapsed,
+                "host": {
+                    "hostname": local_fleet_node.get("hostname", socket.gethostname()),
+                    "device_id": local_fleet_node.get("device_id"),
+                    "role": local_fleet_node.get("role"),
+                    "zerotier_ip": local_fleet_node.get("zerotier_ip"),
+                },
                 "cpu": {
                     "system_percent": cpu_percent,
                     "per_core_percent": cpu_per_core,
