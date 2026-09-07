@@ -68,6 +68,7 @@
   }
 
   interface LocalActivity {
+    api_origin?: string;
     node_id: string;
     sampled_at: string;
     sample_interval_seconds: number;
@@ -228,13 +229,20 @@
 
   function nodeRows(): NodeRow[] {
     const now = Date.now();
-    return (clusterState?.topology?.nodes ?? []).map((nodeId) => {
+    const nodeIds = new Set([
+      ...(clusterState?.topology?.nodes ?? []),
+      ...Object.keys(activities),
+    ]);
+    return [...nodeIds].map((nodeId) => {
       const identity = clusterState?.nodeIdentities?.[nodeId];
       const memory = clusterState?.nodeMemory?.[nodeId];
       const system = clusterState?.nodeSystem?.[nodeId];
       const disk = clusterState?.nodeDisk?.[nodeId];
-      const ip = nodeIp(nodeId);
       const activity = activities[nodeId] ?? null;
+      const activityIp = activity?.api_origin
+        ? new URL(activity.api_origin).hostname
+        : "";
+      const ip = nodeIp(nodeId) || activityIp;
       const fleet =
         fleetNodes().find((item) => item.zerotier_ip === ip) ?? null;
       const memoryTotal =
@@ -390,7 +398,11 @@
 
       const results = await Promise.allSettled(
         [...origins].map(async (origin) => {
-          return (await fetchJson(`${origin}/activity/local`)) as LocalActivity;
+          const activity = (await fetchJson(
+            `${origin}/activity/local`,
+          )) as LocalActivity;
+          activity.api_origin = origin;
+          return activity;
         }),
       );
       const nextActivities = { ...activities };
