@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import json
 import random
+import shutil
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
 import anyio
+import psutil
 from anyio import BrokenResourceError, ClosedResourceError
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -200,6 +202,82 @@ from exo.utils.task_group import TaskGroup
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
+OS1_FLEET_CACHE_SECONDS = 10.0
+OS1_FLEET_RESULT_LIMIT = 20
+
+
+def _counter_rate(current: int, previous: int, elapsed: float) -> float:
+    """Return a non-negative per-second counter rate."""
+    if elapsed <= 0:
+        return 0.0
+    return max(current - previous, 0) / elapsed
+
+
+def _sanitize_fleet_snapshot(payload: object) -> dict[str, object]:
+    """Keep only non-secret resource and readiness fields from OS1 Fleet."""
+    if not isinstance(payload, dict):
+        return {"nodes": []}
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return {"nodes": []}
+
+    allowed = {
+        "cpu_logical_count",
+        "device_id",
+        "exo_nodes",
+        "exo_ready",
+        "has_claude",
+        "has_codex",
+        "hostname",
+        "last_seen_ms",
+        "load_average_1m",
+        "memory_available_mib",
+        "memory_total_mib",
+        "queue_depth",
+        "role",
+        "zerotier_ip",
+    }
+    nodes: list[dict[str, object]] = []
+    for raw_node in raw_nodes:
+        if isinstance(raw_node, dict):
+            nodes.append(
+                {str(key): value for key, value in raw_node.items() if key in allowed}
+            )
+    return {"nodes": nodes}
+
+
+def _read_recent_fleet_jobs(
+    result_directory: Path, limit: int = OS1_FLEET_RESULT_LIMIT
+) -> list[dict[str, object]]:
+    """Read recent Fleet receipt metadata without exposing prompts or output."""
+    if not result_directory.is_dir():
+        return []
+
+    result_files = sorted(
+        result_directory.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+    allowed = {
+        "execution_mode",
+        "executor_device_id",
+        "job_id",
+        "objective_version",
+        "profile",
+        "state",
+    }
+    jobs: list[dict[str, object]] = []
+    for result_file in result_files:
+        try:
+            raw = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        job = {str(key): value for key, value in raw.items() if key in allowed}
+        job["updated_at_ms"] = int(result_file.stat().st_mtime * 1000)
+        jobs.append(job)
+    return jobs
 
 
 def _format_to_content_type(image_format: Literal["png", "jpeg", "webp"] | None) -> str:
@@ -238,6 +316,18 @@ class API:
         self.last_completed_election: int = 0
         self.port = port
         self._sent_image_hashes: set[str] = set()
+        self._activity_lock = anyio.Lock()
+        self._activity_started_at = time.monotonic()
+        self._activity_previous_at = self._activity_started_at
+        self._activity_previous_disk = psutil.disk_io_counters()
+        self._activity_previous_network = psutil.net_io_counters()
+        self._activity_energy_joules = 0.0
+        self._activity_fleet_cache: dict[str, object] = {"nodes": []}
+        self._activity_fleet_cache_at = 0.0
+        self._activity_fleet_error: str | None = None
+        self._activity_process = psutil.Process()
+        psutil.cpu_percent(interval=None)
+        self._activity_process.cpu_percent(interval=None)
 
         self.paused: bool = False
         self.paused_ev: anyio.Event = anyio.Event()
@@ -365,6 +455,7 @@ class API:
 
         self.app.get("/state")(self.get_state)
         self.app.get("/state/{path:path}")(self.get_state)
+        self.app.get("/activity/local")(self.get_local_activity)
         self.app.get("/events")(self.stream_events)
         self.app.post("/download/start")(self.start_download)
         self.app.delete("/download/{node_id}/{model_id:path}")(self.delete_download)
@@ -394,6 +485,163 @@ class API:
                 status_code=404,
                 detail=f"unable to find path '{path.replace('/', '.')}' in state json",
             ) from e
+
+    async def _refresh_fleet_snapshot(self, now: float) -> None:
+        if now - self._activity_fleet_cache_at < OS1_FLEET_CACHE_SECONDS:
+            return
+
+        os1_binary = Path.home() / ".local" / "bin" / "os1"
+        if not os1_binary.is_file():
+            resolved = shutil.which("os1")
+            if resolved is None:
+                self._activity_fleet_error = "OS1 Runtime is not installed"
+                self._activity_fleet_cache_at = now
+                return
+            os1_binary = Path(resolved)
+
+        try:
+            with anyio.fail_after(5):
+                process = await anyio.run_process(
+                    [str(os1_binary), "fleet-snapshot"],
+                    check=False,
+                )
+            if process.returncode != 0:
+                self._activity_fleet_error = (
+                    f"fleet-snapshot exited with status {process.returncode}"
+                )
+            else:
+                payload = json.loads(process.stdout.decode("utf-8"))
+                self._activity_fleet_cache = _sanitize_fleet_snapshot(payload)
+                self._activity_fleet_error = None
+        except TimeoutError:
+            self._activity_fleet_error = "fleet-snapshot timed out"
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._activity_fleet_error = (
+                f"fleet-snapshot unavailable: {type(exc).__name__}"
+            )
+        finally:
+            self._activity_fleet_cache_at = now
+
+    async def get_local_activity(self) -> dict[str, object]:
+        """Return read-only local metrics for the cluster Activity Monitor."""
+        async with self._activity_lock:
+            now = time.monotonic()
+            elapsed = max(now - self._activity_previous_at, 0.001)
+
+            disk = psutil.disk_io_counters()
+            network = psutil.net_io_counters()
+            memory = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            cpu_percent = psutil.cpu_percent(interval=None)
+            cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
+            process_cpu_percent = self._activity_process.cpu_percent(interval=None)
+            process_memory = self._activity_process.memory_info()
+
+            previous_disk = self._activity_previous_disk
+            previous_network = self._activity_previous_network
+            self._activity_previous_at = now
+            self._activity_previous_disk = disk
+            self._activity_previous_network = network
+
+            system = self.state.node_system.get(self.node_id)
+            system_power_watts = system.sys_power if system is not None else 0.0
+            self._activity_energy_joules += max(system_power_watts, 0.0) * elapsed
+
+            await self._refresh_fleet_snapshot(now)
+            fleet_results = Path.home() / ".os1" / "fleet" / "results"
+
+            disk_payload: dict[str, object] = {
+                "read_bytes_per_second": 0.0,
+                "write_bytes_per_second": 0.0,
+                "read_operations_per_second": 0.0,
+                "write_operations_per_second": 0.0,
+            }
+            if disk is not None and previous_disk is not None:
+                disk_payload = {
+                    "read_bytes_per_second": _counter_rate(
+                        disk.read_bytes, previous_disk.read_bytes, elapsed
+                    ),
+                    "write_bytes_per_second": _counter_rate(
+                        disk.write_bytes, previous_disk.write_bytes, elapsed
+                    ),
+                    "read_operations_per_second": _counter_rate(
+                        disk.read_count, previous_disk.read_count, elapsed
+                    ),
+                    "write_operations_per_second": _counter_rate(
+                        disk.write_count, previous_disk.write_count, elapsed
+                    ),
+                }
+
+            network_payload: dict[str, object] = {
+                "received_bytes_per_second": 0.0,
+                "sent_bytes_per_second": 0.0,
+                "received_bytes_total": 0,
+                "sent_bytes_total": 0,
+            }
+            if network is not None:
+                network_payload["received_bytes_total"] = network.bytes_recv
+                network_payload["sent_bytes_total"] = network.bytes_sent
+                if previous_network is not None:
+                    network_payload["received_bytes_per_second"] = _counter_rate(
+                        network.bytes_recv, previous_network.bytes_recv, elapsed
+                    )
+                    network_payload["sent_bytes_per_second"] = _counter_rate(
+                        network.bytes_sent, previous_network.bytes_sent, elapsed
+                    )
+
+            load_average = psutil.getloadavg()
+            return {
+                "schema": 1,
+                "node_id": str(self.node_id),
+                "sampled_at": datetime.now(timezone.utc).isoformat(),
+                "sample_interval_seconds": elapsed,
+                "cpu": {
+                    "system_percent": cpu_percent,
+                    "per_core_percent": cpu_per_core,
+                    "logical_count": psutil.cpu_count(logical=True) or 0,
+                    "load_average_1m": load_average[0],
+                    "exo_process_percent": process_cpu_percent,
+                },
+                "memory": {
+                    "total_bytes": memory.total,
+                    "used_bytes": memory.used,
+                    "available_bytes": memory.available,
+                    "swap_total_bytes": swap.total,
+                    "swap_used_bytes": swap.used,
+                    "exo_process_resident_bytes": process_memory.rss,
+                },
+                "gpu": {
+                    "usage_percent": (system.gpu_usage * 100) if system else 0.0,
+                    "temperature_celsius": system.temp if system else 0.0,
+                    "performance_cpu_percent": (
+                        system.pcpu_usage * 100 if system else 0.0
+                    ),
+                    "efficiency_cpu_percent": (
+                        system.ecpu_usage * 100 if system else 0.0
+                    ),
+                },
+                "energy": {
+                    "system_power_watts": system_power_watts,
+                    "monitor_session_joules": self._activity_energy_joules,
+                    "monitor_session_watt_hours": self._activity_energy_joules / 3600,
+                    "monitor_uptime_seconds": now - self._activity_started_at,
+                },
+                "disk": disk_payload,
+                "network": network_payload,
+                "exo": {
+                    "topology_nodes": len(self.state.topology.list_nodes()),
+                    "instances": len(self.state.instances),
+                    "runners": len(self.state.runners),
+                    "tasks": len(self.state.tasks),
+                    "last_event_applied_index": self.state.last_event_applied_idx,
+                },
+                "fleet": {
+                    **self._activity_fleet_cache,
+                    "cache_age_seconds": max(now - self._activity_fleet_cache_at, 0),
+                    "error": self._activity_fleet_error,
+                    "recent_jobs": _read_recent_fleet_jobs(fleet_results),
+                },
+            }
 
     async def place_instance(self, payload: PlaceInstanceParams):
         command = PlaceInstance(

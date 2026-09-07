@@ -221,6 +221,24 @@
       </button>
     {/if}
     <a
+      href="/#/activity"
+      class="text-xs md:text-sm text-white/70 hover:text-exo-yellow transition-colors tracking-wider uppercase flex items-center gap-1.5 md:gap-2 cursor-pointer"
+      title="Two-node CPU, memory, GPU, energy, disk, network, and Fleet activity"
+    >
+      <svg
+        class="w-4 h-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M3 12h4l2-7 4 14 2-7h6" />
+      </svg>
+      <span class="hidden lg:inline">Activity</span>
+    </a>
+    <a
       href="/#/downloads"
       class="text-xs md:text-sm text-white/70 hover:text-exo-yellow transition-colors tracking-wider uppercase flex items-center gap-1.5 md:gap-2 cursor-pointer"
       title="View downloads overview"
