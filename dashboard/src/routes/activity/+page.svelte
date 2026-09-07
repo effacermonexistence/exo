@@ -117,6 +117,18 @@
       received_bytes_total: number;
       sent_bytes_total: number;
     };
+    roaming?: {
+      available: boolean;
+      stale: boolean;
+      state: string;
+      sampled_at?: string;
+      age_seconds?: number;
+      recovery_count?: number;
+      peer_reachable?: boolean;
+      peer_api_ip?: string;
+      network_changed_at?: string;
+      last_recovery_at?: string;
+    };
     exo: {
       topology_nodes: number;
       instances: number;
@@ -170,6 +182,7 @@
   let histories: Record<string, HistoryPoint[]> = $state({});
   let stateError: string | null = $state(null);
   let lastRefresh = $state(0);
+  let observedAt = $state(Date.now());
   let polling = false;
   let balance = $derived(convergence());
   let totals = $derived(clusterTotals());
@@ -234,7 +247,7 @@
   }
 
   function nodeRows(): NodeRow[] {
-    const now = Date.now();
+    const now = observedAt;
     const nodeIds = new Set([
       ...(clusterState?.topology?.nodes ?? []),
       ...Object.keys(activities),
@@ -302,9 +315,39 @@
         networkSend: activity?.network.sent_bytes_per_second ?? 0,
         diskAvailable: disk?.available?.inBytes ?? 0,
         diskTotal: disk?.total?.inBytes ?? 0,
-        stale: !activity || now - sampledAt > 15_000,
+        stale:
+          !activity ||
+          !Number.isFinite(sampledAt) ||
+          now - sampledAt > 15_000 ||
+          sampledAt - now > 5_000,
       };
     });
+  }
+
+  function roamingStatus(row: NodeRow): { label: string; healthy: boolean } {
+    const roaming = row.activity?.roaming;
+    if (!roaming?.available) {
+      return { label: "자동 복구 정보 없음 · 설치 확인 필요", healthy: false };
+    }
+    const age = observedAt - Date.parse(roaming.sampled_at ?? "");
+    if (row.stale || roaming.stale || !Number.isFinite(age) || age > 60_000 || age < -5_000) {
+      return { label: "자동 복구 상태 갱신 대기", healthy: false };
+    }
+    const labels: Record<string, string> = {
+      starting: "자동 복구 시작 중",
+      connected: "연결 정상 · Wi-Fi 이동 감시 중",
+      waiting_for_network: "네트워크 또는 상대 Mac 연결 대기",
+      reconnecting: "네트워크 복구됨 · EXO 재연결 중",
+      waiting_for_idle: "실행 중인 작업 보호 · 복구 대기",
+      recovering: "EXO 자동 복구 중",
+      cooldown: "재시도 간격 대기",
+      attention_required: "자동 복구 점검 필요",
+      degraded: "연결 복구 확인 필요",
+    };
+    return {
+      label: labels[roaming.state] ?? "자동 복구 상태 확인 필요",
+      healthy: roaming.state === "connected",
+    };
   }
 
   function clusterTotals() {
@@ -408,6 +451,7 @@
   }
 
   async function poll(): Promise<void> {
+    observedAt = Date.now();
     if (polling) return;
     polling = true;
     try {
@@ -552,6 +596,7 @@
 
     <section class="grid grid-cols-1 2xl:grid-cols-2 gap-5 mb-5">
       {#each nodeRows() as row}
+        {@const roaming = roamingStatus(row)}
         <article
           class="command-panel rounded-lg p-5 border-l-2 {row.stale
             ? 'border-l-amber-400'
@@ -580,6 +625,20 @@
                 EXO {row.activity?.exo.topology_nodes ?? 0} · queue {row.fleet?.queue_depth ?? 0}
               </div>
             </div>
+          </div>
+
+          <div
+            class="mb-4 rounded border px-3 py-2 text-[11px] {roaming.healthy
+              ? 'border-emerald-400/20 bg-emerald-400/5 text-emerald-300'
+              : 'border-amber-400/20 bg-amber-400/5 text-amber-200'}"
+          >
+            <span class="mr-2 text-white/45">Wi-Fi 이동</span>
+            {roaming.label}
+            {#if row.activity?.roaming?.available && !row.activity.roaming.stale && !row.stale}
+              <span class="ml-2 text-white/40">
+                복구 {row.activity.roaming.recovery_count ?? 0}회
+              </span>
+            {/if}
           </div>
 
           <div class="grid grid-cols-2 md:grid-cols-4 gap-3">

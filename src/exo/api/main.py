@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
@@ -207,6 +208,80 @@ ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
 OS1_FLEET_CACHE_SECONDS = 10.0
 OS1_FLEET_TIMEOUT_SECONDS = 30.0
 OS1_FLEET_RESULT_LIMIT = 20
+OS1_ROAMING_STALE_SECONDS = 60.0
+OS1_ROAMING_STATES = {
+    "starting",
+    "connected",
+    "waiting_for_network",
+    "reconnecting",
+    "waiting_for_idle",
+    "recovering",
+    "cooldown",
+    "attention_required",
+    "degraded",
+}
+
+
+def _read_roaming_status(path: Path, now: datetime | None = None) -> dict[str, object]:
+    """Read bounded, non-secret roaming evidence without controlling the service."""
+    unavailable: dict[str, object] = {
+        "available": False,
+        "stale": True,
+        "state": "unavailable",
+    }
+    try:
+        with path.open("rb") as status_file:
+            encoded = status_file.read(16_385)
+        if len(encoded) > 16_384:
+            return {**unavailable, "state": "invalid"}
+        raw: object = json.loads(encoded)
+        if not isinstance(raw, dict):
+            return {**unavailable, "state": "invalid"}
+        payload = cast(dict[str, object], raw)
+        sampled_at = payload.get("sampled_at")
+        state = payload.get("state")
+        role = payload.get("role")
+        if (
+            payload.get("schema") != 1
+            or role not in ("air", "pro")
+            or not isinstance(state, str)
+            or state not in OS1_ROAMING_STATES
+            or not isinstance(sampled_at, str)
+        ):
+            return {**unavailable, "state": "invalid"}
+        sampled = datetime.fromisoformat(sampled_at)
+        if sampled.tzinfo is None:
+            return {**unavailable, "state": "invalid"}
+        age = ((now or datetime.now(timezone.utc)) - sampled).total_seconds()
+        result: dict[str, object] = {
+            "schema": 1,
+            "available": True,
+            "stale": age > OS1_ROAMING_STALE_SECONDS or age < -5,
+            "age_seconds": max(age, 0.0),
+            "state": state,
+            "role": role,
+            "sampled_at": sampled.isoformat(),
+        }
+        for key in ("network_changed_at", "last_recovery_at"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is not None:
+                    result[key] = parsed.isoformat()
+        recovery_count = payload.get("recovery_count")
+        if type(recovery_count) is int and recovery_count >= 0:
+            result["recovery_count"] = recovery_count
+        peer_reachable = payload.get("peer_reachable")
+        if isinstance(peer_reachable, bool):
+            result["peer_reachable"] = peer_reachable
+        peer_api_ip = payload.get("peer_api_ip")
+        if isinstance(peer_api_ip, str):
+            result["peer_api_ip"] = str(ip_address(peer_api_ip))
+        return result
+    except FileNotFoundError:
+        return unavailable
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {**unavailable, "state": "invalid"}
 
 
 def _counter_rate(current: int, previous: int, elapsed: float) -> float:
@@ -554,9 +629,8 @@ class API:
             self._activity_energy_joules += max(system_power_watts, 0.0) * elapsed
 
             fleet_refresh = self._activity_fleet_refresh_task
-            if (
-                now - self._activity_fleet_cache_at >= OS1_FLEET_CACHE_SECONDS
-                and (fleet_refresh is None or fleet_refresh.done())
+            if now - self._activity_fleet_cache_at >= OS1_FLEET_CACHE_SECONDS and (
+                fleet_refresh is None or fleet_refresh.done()
             ):
                 self._activity_fleet_refresh_task = asyncio.create_task(
                     self._refresh_fleet_snapshot(now)
@@ -663,6 +737,9 @@ class API:
                 },
                 "disk": disk_payload,
                 "network": network_payload,
+                "roaming": _read_roaming_status(
+                    Path.home() / ".os1" / "exo-roaming" / "status.json"
+                ),
                 "exo": {
                     "topology_nodes": len(self.state.topology.list_nodes()),
                     "instances": len(self.state.instances),

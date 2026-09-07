@@ -1,10 +1,12 @@
 import json
 import socket
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from exo.api.main import (
     _counter_rate,
     _read_recent_fleet_jobs,
+    _read_roaming_status,
     _sanitize_fleet_snapshot,
 )
 
@@ -66,3 +68,64 @@ def test_recent_fleet_jobs_exposes_metadata_only(tmp_path: Path) -> None:
 
 def test_hostname_is_available_for_activity_fallback() -> None:
     assert socket.gethostname()
+
+
+def test_roaming_status_requires_fresh_evidence_and_excludes_private_fields(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    path = tmp_path / "status.json"
+    payload = {
+        "schema": 1,
+        "role": "pro",
+        "state": "connected",
+        "sampled_at": now.isoformat(),
+        "recovery_count": 1,
+        "peer_reachable": True,
+        "peer_api_ip": "10.215.90.216",
+        "ssid": "private hotel network",
+        "token": "must-not-leak",
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    fresh = _read_roaming_status(path, now=now)
+    assert fresh["available"] is True
+    assert fresh["stale"] is False
+    assert fresh["peer_api_ip"] == "10.215.90.216"
+    assert "ssid" not in fresh
+    assert "token" not in fresh
+    assert _read_roaming_status(path, now=now + timedelta(seconds=61))["stale"]
+    assert _read_roaming_status(path, now=now - timedelta(seconds=10))["stale"]
+
+
+def test_roaming_status_missing_corrupt_and_oversized_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "status.json"
+    assert _read_roaming_status(path) == {
+        "available": False,
+        "stale": True,
+        "state": "unavailable",
+    }
+    for content in ("{", "[]", "x" * 16_385):
+        path.write_text(content, encoding="utf-8")
+        status = _read_roaming_status(path)
+        assert status["available"] is False
+        assert status["stale"] is True
+
+
+def test_roaming_status_naive_timestamp_and_unknown_state_are_not_healthy(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "status.json"
+    for state, sampled_at in (
+        ("connected", "2026-09-07T00:00:00"),
+        ("private detail", "2026-09-07T00:00:00Z"),
+    ):
+        path.write_text(
+            json.dumps(
+                {"schema": 1, "role": "air", "state": state, "sampled_at": sampled_at}
+            ),
+            encoding="utf-8",
+        )
+        assert _read_roaming_status(path)["available"] is False
