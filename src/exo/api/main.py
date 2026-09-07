@@ -524,7 +524,9 @@ class API:
                 f"fleet-snapshot unavailable: {type(exc).__name__}"
             )
         finally:
-            self._activity_fleet_cache_at = now
+            # Age the cache from completion, not from the start of a slow
+            # hotel-network request, otherwise every UI poll starts a new one.
+            self._activity_fleet_cache_at = time.monotonic()
 
     async def get_local_activity(self) -> dict[str, object]:
         """Return read-only local metrics for the cluster Activity Monitor."""
