@@ -205,6 +205,7 @@ from exo.utils.task_group import TaskGroup
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
 OS1_FLEET_CACHE_SECONDS = 10.0
+OS1_FLEET_TIMEOUT_SECONDS = 30.0
 OS1_FLEET_RESULT_LIMIT = 20
 
 
@@ -503,7 +504,7 @@ class API:
             os1_binary = Path(resolved)
 
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(OS1_FLEET_TIMEOUT_SECONDS):
                 process = await anyio.run_process(
                     [str(os1_binary), "fleet-snapshot"],
                     check=False,
